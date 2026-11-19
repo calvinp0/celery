@@ -91,10 +91,28 @@ class Redis(conftest.MockCallbacks):
         self.db = db
         self.password = password
         self.keyspace = {}
-        self.expiry = {}
+        self.expiry = {}  # Maps key -> absolute expiration timestamp
+        self.current_time = 0  # Controllable clock for TTL simulation
         self.connection = self.Connection()
 
+    def advance_time(self, seconds):
+        """Advance the mock clock by the specified number of seconds."""
+        self.current_time += seconds
+        # Clean up expired keys
+        expired_keys = [
+            key for key, expiry in self.expiry.items()
+            if expiry <= self.current_time
+        ]
+        for key in expired_keys:
+            self.keyspace.pop(key, None)
+            self.expiry.pop(key, None)
+
     def get(self, key):
+        # Check if key has expired
+        if key in self.expiry and self.expiry[key] <= self.current_time:
+            self.keyspace.pop(key, None)
+            self.expiry.pop(key, None)
+            return None
         return self.keyspace.get(key)
 
     def mget(self, keys):
@@ -104,13 +122,17 @@ class Redis(conftest.MockCallbacks):
         self.set(key, value)
         self.expire(key, expires)
 
-    def set(self, key, value, ex=None):
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.keyspace:
+            return None  # Key already exists, NX fails
         self.keyspace[key] = value
         if ex:
             self.expire(key, ex)
+        return True
 
     def expire(self, key, expires):
-        self.expiry[key] = expires
+        # Store absolute expiration timestamp (current_time + expires)
+        self.expiry[key] = self.current_time + expires
         return expires
 
     def delete(self, key):
@@ -169,29 +191,63 @@ class Redis(conftest.MockCallbacks):
         return 1
 
     def register_script(self, script):
-        # Only the chord part script of the backend is used; emulate it
-        # with the fake commands above.
-        def chord_part_return(keys, args, client=None):
-            jkey, tkey, skey, dkey, gkey = keys
-            tid, value, ordered, score, expires, group_expires = args
-            member = f'{tid}:{score}'
-            if member not in self.keyspace.get(dkey, set()):
-                if ordered:
-                    self.zadd(jkey, {value: score})
+        if 'CHORD_CLEANUP_LUA' in script or ('token' in script and 'DEL' in script and 'jkey' in script):
+            def chord_cleanup(keys, args, client=None):
+                ckey, jkey, tkey, skey, dkey = keys
+                token = args[0]
+                done_expires = int(args[1]) if len(args) > 1 else None
+                current = self.get(ckey)
+                if current == token.encode() if isinstance(token, str) else token:
+                    self.delete(jkey)
+                    self.delete(tkey)
+                    self.delete(skey)
+                    self.delete(dkey)
+                    if done_expires and done_expires > 0:
+                        self.set(ckey, b'done', ex=done_expires)
+                    return 1
                 else:
-                    self.rpush(jkey, value)
-                self.sadd(dkey, member)
-            if ordered:
-                readycount = self.zcount(jkey, '-inf', '+inf')
-            else:
-                readycount = self.llen(jkey)
-            if expires:
-                for key in (jkey, tkey, skey, dkey):
-                    self.expire(key, expires)
-                if group_expires:
-                    self.expire(gkey, group_expires)
-            return [readycount, self.get(tkey), self.get(skey)]
-        return chord_part_return
+                    return 0
+            return chord_cleanup
+        else:
+            def chord_part_return(keys, args, client=None):
+                jkey, tkey, skey, dkey, gkey, ckey = keys
+                tid, value, ordered, score, expires, group_expires, claim_expires, claim_token = args
+
+                current_ckey = self.get(ckey)
+                if current_ckey == b'done':
+                    return [-1, 0, 0, 0]
+
+                member = f'{tid}:{score}'
+                if member not in self.keyspace.get(dkey, set()):
+                    if ordered:
+                        self.zadd(jkey, {value: score})
+                    else:
+                        self.rpush(jkey, value)
+                    self.sadd(dkey, member)
+                if ordered:
+                    readycount = self.zcount(jkey, '-inf', '+inf')
+                else:
+                    readycount = self.llen(jkey)
+                if expires:
+                    for key in (jkey, tkey, skey, dkey):
+                        self.expire(key, expires)
+                    if group_expires:
+                        self.expire(gkey, group_expires)
+
+                totaldiff = self.get(tkey)
+                size = self.get(skey)
+                claimed = 0
+                if size and readycount == int(size) + int(totaldiff or 0):
+                    if ckey not in self.keyspace or self.get(ckey) is None:
+                        token_bytes = (
+                            claim_token.encode() if isinstance(claim_token, str)
+                            else claim_token
+                        )
+                        self.set(ckey, token_bytes, ex=claim_expires)
+                        claimed = 1
+
+                return [readycount, totaldiff, size, claimed]
+            return chord_part_return
 
 
 class Sentinel(conftest.MockCallbacks):
@@ -2278,8 +2334,12 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         ])
 
     def test_on_chord_part_return_no_expiry(self):
+        old_chord_expires = self.app.conf.result_chord_expires
         old_expires = self.b.expires
-        self.b.expires = None
+        self.app.conf.result_chord_expires = 0
+        self.b.expires = 0
+        # Reinitialize backend to pick up new config
+        self.b = self.Backend(app=self.app)
         tasks = [self.create_task(i) for i in range(10)]
         self.b.set_chord_size('group_id', 10)
 
@@ -2290,14 +2350,26 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         assert self.b.client.zrangebyscore.call_count
         jkey = self.b.get_key_for_group('group_id', '.j')
         tkey = self.b.get_key_for_group('group_id', '.t')
-        self.b.client.delete.assert_has_calls([call(jkey), call(tkey)])
-        self.b.client.expire.assert_not_called()
+        skey = self.b.get_key_for_group('group_id', '.s')
+        dkey = self.b.get_key_for_group('group_id', '.d')
+        self.b.client.delete.assert_has_calls([call(jkey), call(tkey), call(skey), call(dkey)], any_order=True)
+        # When chord_expires is 0, chord keys (.j, .t, .s, .d) don't expire
+        # but the claim key (.c) gets a default timeout for crash recovery
+        # Verify chord keys were not expired
+        for key in [jkey, tkey, skey, dkey]:
+            for call_args in self.b.client.expire.call_args_list:
+                assert call_args[0][0] != key
 
+        self.app.conf.result_chord_expires = old_chord_expires
         self.b.expires = old_expires
 
     def test_on_chord_part_return_expire_set_to_zero(self):
+        old_chord_expires = self.app.conf.result_chord_expires
         old_expires = self.b.expires
+        self.app.conf.result_chord_expires = 0
         self.b.expires = 0
+        # Reinitialize backend to pick up new config
+        self.b = self.Backend(app=self.app)
         tasks = [self.create_task(i) for i in range(10)]
 
         for i in range(10):
@@ -2307,9 +2379,27 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         assert self.b.client.zrangebyscore.call_count
         jkey = self.b.get_key_for_group('group_id', '.j')
         tkey = self.b.get_key_for_group('group_id', '.t')
-        self.b.client.delete.assert_has_calls([call(jkey), call(tkey)])
-        self.b.client.expire.assert_not_called()
+        skey = self.b.get_key_for_group('group_id', '.s')
+        dkey = self.b.get_key_for_group('group_id', '.d')
+        ckey = self.b.get_key_for_group('group_id', '.c')
+        self.b.client.delete.assert_has_calls(
+            [call(jkey), call(tkey), call(skey), call(dkey)],
+            any_order=True
+        )
+        # With the new implementation, cleanup leaves a 'done' marker in ckey
+        # instead of deleting it
+        self.b.client.set.assert_any_call(ckey, b'done', ex=ANY)
+        # When chord_expires is 0, chord keys (.j, .t, .s, .d) don't expire
+        # but the claim key (.c) gets a default timeout for crash recovery
+        # Verify chord keys were not expired, but claim key was
+        for key in [jkey, tkey, skey, dkey]:
+            for call_args in self.b.client.expire.call_args_list:
+                assert call_args[0][0] != key
+        # The claim key should have been expired with the default timeout
+        claim_expired = any(call_args[0][0] == ckey for call_args in self.b.client.expire.call_args_list)
+        assert claim_expired
 
+        self.app.conf.result_chord_expires = old_chord_expires
         self.b.expires = old_expires
 
     def test_on_chord_part_return_no_expiry__unordered(self):
@@ -2317,8 +2407,12 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
             result_chord_ordered=False,
         )
 
+        old_chord_expires = self.app.conf.result_chord_expires
         old_expires = self.b.expires
-        self.b.expires = None
+        self.app.conf.result_chord_expires = 0
+        self.b.expires = 0
+        # Reinitialize backend to pick up new config
+        self.b = self.Backend(app=self.app)
         tasks = [self.create_task(i) for i in range(10)]
 
         for i in range(10):
@@ -2328,9 +2422,24 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         assert self.b.client.lrange.call_count
         jkey = self.b.get_key_for_group('group_id', '.j')
         tkey = self.b.get_key_for_group('group_id', '.t')
-        self.b.client.delete.assert_has_calls([call(jkey), call(tkey)])
-        self.b.client.expire.assert_not_called()
+        skey = self.b.get_key_for_group('group_id', '.s')
+        dkey = self.b.get_key_for_group('group_id', '.d')
+        ckey = self.b.get_key_for_group('group_id', '.c')
+        self.b.client.delete.assert_has_calls(
+            [call(jkey), call(tkey), call(skey), call(dkey)],
+            any_order=True
+        )
+        # With the new implementation, cleanup leaves a 'done' marker in ckey
+        # instead of deleting it
+        self.b.client.set.assert_any_call(ckey, b'done', ex=ANY)
+        # When chord_expires is 0, chord keys don't expire but claim gets default timeout
+        for key in [jkey, tkey, skey, dkey]:
+            for call_args in self.b.client.expire.call_args_list:
+                assert call_args[0][0] != key
+        claim_expired = any(call_args[0][0] == ckey for call_args in self.b.client.expire.call_args_list)
+        assert claim_expired
 
+        self.app.conf.result_chord_expires = old_chord_expires
         self.b.expires = old_expires
 
     def test_on_chord_part_return_no_expiry__ordered(self):
@@ -2338,8 +2447,12 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
             result_chord_ordered=True,
         )
 
+        old_chord_expires = self.app.conf.result_chord_expires
         old_expires = self.b.expires
-        self.b.expires = None
+        self.app.conf.result_chord_expires = 0
+        self.b.expires = 0
+        # Reinitialize backend to pick up new config
+        self.b = self.Backend(app=self.app)
         tasks = [self.create_task(i) for i in range(10)]
 
         for i in range(10):
@@ -2349,9 +2462,24 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         assert self.b.client.zrangebyscore.call_count
         jkey = self.b.get_key_for_group('group_id', '.j')
         tkey = self.b.get_key_for_group('group_id', '.t')
-        self.b.client.delete.assert_has_calls([call(jkey), call(tkey)])
-        self.b.client.expire.assert_not_called()
+        skey = self.b.get_key_for_group('group_id', '.s')
+        dkey = self.b.get_key_for_group('group_id', '.d')
+        ckey = self.b.get_key_for_group('group_id', '.c')
+        self.b.client.delete.assert_has_calls(
+            [call(jkey), call(tkey), call(skey), call(dkey)],
+            any_order=True
+        )
+        # With the new implementation, cleanup leaves a 'done' marker in ckey
+        # instead of deleting it
+        self.b.client.set.assert_any_call(ckey, b'done', ex=ANY)
+        # When chord_expires is 0, chord keys don't expire but claim gets default timeout
+        for key in [jkey, tkey, skey, dkey]:
+            for call_args in self.b.client.expire.call_args_list:
+                assert call_args[0][0] != key
+        claim_expired = any(call_args[0][0] == ckey for call_args in self.b.client.expire.call_args_list)
+        assert claim_expired
 
+        self.app.conf.result_chord_expires = old_chord_expires
         self.b.expires = old_expires
 
     def test_on_chord_part_return__success(self):
@@ -2548,11 +2676,12 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
             # is sent, so the redelivered part must still send it.
             request = tasks[1].request
             keys = [self.b.get_key_for_group(request.group, suffix)
-                    for suffix in ('.j', '.t', '.s', '.d', '')]
+                    for suffix in ('.j', '.t', '.s', '.d', '', '.c')]
             encoded = self.b.encode([1, request.id, states.SUCCESS,
                                      self.b.encode_result(20, states.SUCCESS)])
-            self.b._chord_part_return_script(
-                keys=keys, args=[request.id, encoded, 1, request.group_index, 0, 0])
+            # This call simulates the worker recording the part but crashing before cleanup
+            readycount, totaldiff, chord_size_bytes, claimed = self.b._chord_part_return_script(
+                keys=keys, args=[request.id, encoded, 1, request.group_index, 0, 0, 0, None])
             callback.delay.assert_not_called()
             self.b.on_chord_part_return(request, states.SUCCESS, 20)
             callback.delay.assert_called_once_with([10, 20])
@@ -2596,6 +2725,142 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
             callback.delay.assert_not_called()
             self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
             callback.delay.assert_called_once_with(expected)
+
+    def test_on_chord_part_return__concurrent_duplicate_during_dispatch(self):
+        """Test that a concurrent duplicate completion during active dispatch
+        cannot steal the claim or cause a second callback dispatch."""
+        with self.chord_context(3) as (tasks, _, callback):
+            duplicate_invoked = []
+
+            def inject_duplicate(*args, **kwargs):
+                if callback.delay.call_count == 1:
+                    # Inject a duplicate completion while dispatch is in progress
+                    # This simulates a concurrent duplicate from another worker
+                    self.b.on_chord_part_return(
+                        tasks[0].request, states.SUCCESS, 10
+                    )
+                    duplicate_invoked.append(True)
+
+            callback.delay.side_effect = inject_duplicate
+
+            self.b.on_chord_part_return(
+                tasks[0].request, states.SUCCESS, 10
+            )
+            self.b.on_chord_part_return(
+                tasks[1].request, states.SUCCESS, 20
+            )
+            self.b.on_chord_part_return(
+                tasks[2].request, states.SUCCESS, 30
+            )
+
+            # Verify the duplicate was invoked during dispatch
+            assert duplicate_invoked
+            # But callback was still only called once
+            callback.delay.assert_called_once_with([10, 20, 30])
+
+    def test_on_chord_part_return__claim_uses_chord_expires(self):
+        """Test that the dispatch claim uses chord_expires for consistency."""
+        self.app.conf.result_chord_expires = 600
+        self.b = self.Backend(app=self.app)
+        tasks = [self.create_task(i) for i in range(3)]
+        self.b.set_chord_size('group_id', 3)
+
+        # Complete all tasks
+        for i, task in enumerate(tasks):
+            self.b.on_chord_part_return(task.request, states.SUCCESS, (i + 1) * 10)
+
+        # Verify the claim key gets a 'done' marker instead of being deleted
+        ckey = self.b.get_key_for_group('group_id', '.c')
+        jkey = self.b.get_key_for_group('group_id', '.j')
+        tkey = self.b.get_key_for_group('group_id', '.t')
+        skey = self.b.get_key_for_group('group_id', '.s')
+        dkey = self.b.get_key_for_group('group_id', '.d')
+        self.b.client.delete.assert_has_calls([
+            call(jkey), call(tkey), call(skey), call(dkey)
+        ], any_order=True)
+        self.b.client.set.assert_any_call(ckey, b'done', ex=ANY)
+
+    def test_on_chord_part_return__default_claim_timeout(self):
+        """Test that the default claim timeout is used when chord_expires is not set."""
+        old_chord_expires = self.app.conf.result_chord_expires
+        self.app.conf.result_chord_expires = None
+        self.b = self.Backend(app=self.app)
+
+        with self.chord_context(3) as (tasks, _, callback):
+            self.b.on_chord_part_return(tasks[0].request, states.SUCCESS, 10)
+            self.b.on_chord_part_return(tasks[1].request, states.SUCCESS, 20)
+            callback.delay.assert_not_called()
+
+            self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
+            callback.delay.assert_called_once_with([10, 20, 30])
+
+            # With the new implementation, cleanup leaves a 'done' marker instead of deleting ckey
+            ckey = self.b.get_key_for_group(tasks[0].request.group, '.c')
+            self.b.client.set.assert_any_call(ckey, b'done', ex=ANY)
+
+        self.app.conf.result_chord_expires = old_chord_expires
+
+    def test_on_chord_part_return__restore_error_preserves_claim(self):
+        """Test that a GroupResult.restore() error after claim acquisition preserves the claim.
+
+        When GroupResult.restore() or join() fails after claim acquisition, the outer
+        exception handler does not run the ownership-checked cleanup. The claim remains
+        until its TTL expires, which is an acceptable recovery strategy.
+        """
+        old_chord_expires = self.app.conf.result_chord_expires
+        self.app.conf.result_chord_expires = 600
+        self.b = self.Backend(app=self.app)
+
+        with self.chord_context(3) as (tasks, _, callback):
+            self.b.on_chord_part_return(tasks[0].request, states.SUCCESS, 10)
+            self.b.on_chord_part_return(tasks[1].request, states.SUCCESS, 20)
+            callback.delay.assert_not_called()
+
+            ckey = self.b.get_key_for_group(tasks[0].request.group, '.c')
+
+            original_restore = GroupResult.restore
+
+            def restore_with_error(*args, **kwargs):
+                raise RuntimeError("Restore failed")
+            GroupResult.restore = restore_with_error
+
+            with patch.object(self.b, 'chord_error_from_stack'):
+                self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
+
+            assert ckey in self.b.client.keyspace
+            assert self.b.client.keyspace[ckey] != 'done'
+
+            GroupResult.restore = original_restore
+
+        self.app.conf.result_chord_expires = old_chord_expires
+
+    def test_on_chord_part_return__duplicate_with_existing_claim(self):
+        """Test that a duplicate completion is suppressed when a claim still exists."""
+        old_chord_expires = self.app.conf.result_chord_expires
+        self.app.conf.result_chord_expires = 600
+        self.b = self.Backend(app=self.app)
+
+        with self.chord_context(3) as (tasks, _, callback):
+            self.b.on_chord_part_return(tasks[0].request, states.SUCCESS, 10)
+            self.b.on_chord_part_return(tasks[1].request, states.SUCCESS, 20)
+            callback.delay.assert_not_called()
+
+            original_cleanup_script = self.b._chord_cleanup_script
+
+            def prevent_cleanup(keys, args, client=None):
+                return 0
+            self.b._chord_cleanup_script = prevent_cleanup
+
+            self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
+            callback.delay.assert_called_once_with([10, 20, 30])
+
+            self.b._chord_cleanup_script = original_cleanup_script
+
+            callback.delay.reset_mock()
+            self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
+            callback.delay.assert_not_called()
+
+        self.app.conf.result_chord_expires = old_chord_expires
 
 
 class test_RedisBackend_chord_part_script(basetest_RedisBackend):
@@ -2645,20 +2910,178 @@ class test_RedisBackend_chord_part_script(basetest_RedisBackend):
             self.b.on_chord_part_return(tasks[1].request, states.SUCCESS, 20)
             callback.delay.assert_called_once_with([10, 20])
 
+    def test_on_chord_part_return__concurrent_duplicate_during_dispatch(self):
+        """Test that a concurrent duplicate completion during active dispatch
+        cannot steal the claim or cause a second callback dispatch."""
+        with self.chord_context(3) as (tasks, _, callback):
+            duplicate_invoked = []
+
+            def inject_duplicate(*args, **kwargs):
+                if callback.delay.call_count == 1:
+                    # Inject a duplicate completion while dispatch is in progress
+                    # This simulates a concurrent duplicate from another worker
+                    self.b.on_chord_part_return(
+                        tasks[0].request, states.SUCCESS, 10
+                    )
+                    duplicate_invoked.append(True)
+
+            callback.delay.side_effect = inject_duplicate
+
+            self.b.on_chord_part_return(
+                tasks[0].request, states.SUCCESS, 10
+            )
+            self.b.on_chord_part_return(
+                tasks[1].request, states.SUCCESS, 20
+            )
+            self.b.on_chord_part_return(
+                tasks[2].request, states.SUCCESS, 30
+            )
+
+            # Verify the duplicate was invoked during dispatch
+            assert duplicate_invoked
+            # But callback was still only called once
+            callback.delay.assert_called_once_with([10, 20, 30])
+
+    def test_on_chord_part_return__claim_ownership_safe_cleanup(self):
+        """Test that a worker cannot delete another worker's claim or chord data.
+
+        Verifies that ownership validation prevents stale cleanup from deleting
+        active chord state, and that cleanup leaves a done marker.
+        """
+        old_chord_expires = self.app.conf.result_chord_expires
+        self.app.conf.result_chord_expires = 600
+        self.b = self.Backend(app=self.app)
+        self.b.client = self.FakeRedis()
+
+        with self.chord_context(3) as (tasks, _, callback):
+            self.b.on_chord_part_return(tasks[0].request, states.SUCCESS, 10)
+            self.b.on_chord_part_return(tasks[1].request, states.SUCCESS, 20)
+            callback.delay.assert_not_called()
+
+            ckey = self.b.get_key_for_group(tasks[0].request.group, '.c')
+            jkey = self.b.get_key_for_group(tasks[0].request.group, '.j')
+            tkey = self.b.get_key_for_group(tasks[0].request.group, '.t')
+            skey = self.b.get_key_for_group(tasks[0].request.group, '.s')
+            dkey = self.b.get_key_for_group(tasks[0].request.group, '.d')
+
+            original_cleanup_script = self.b._chord_cleanup_script
+            token_a = None
+
+            def simulate_worker_a_crash(keys, args, client=None):
+                nonlocal token_a
+                token_a = args[0]
+                return 0
+            self.b._chord_cleanup_script = simulate_worker_a_crash
+
+            self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
+            callback.delay.assert_called_once_with([10, 20, 30])
+
+            assert self.b.client.get(ckey) is not None
+            token_a = self.b.client.get(ckey)
+
+            self.b.client.delete(ckey)
+
+            def prevent_worker_b_cleanup(keys, args, client=None):
+                return 0
+            self.b._chord_cleanup_script = prevent_worker_b_cleanup
+
+            callback.delay.reset_mock()
+            self.b.on_chord_part_return(tasks[2].request, states.SUCCESS, 30)
+            callback.delay.assert_called_once_with([10, 20, 30])
+
+            token_b = self.b.client.get(ckey)
+            assert token_b is not None
+            assert token_a != token_b
+
+            keys = [ckey, jkey, tkey, skey, dkey]
+            existing_before_stale_cleanup = {
+                key: self.b.client.exists(key) for key in keys
+            }
+
+            cleanup_result = original_cleanup_script(
+                keys=[ckey, jkey, tkey, skey, dkey],
+                args=[token_a, int(600)],
+                client=self.b.client,
+            )
+            assert cleanup_result == 0
+
+            for key, existed in existing_before_stale_cleanup.items():
+                assert self.b.client.exists(key) == existed, f"Key {key} was modified by stale cleanup"
+
+            assert self.b.client.get(ckey) == token_b
+
+            # With the new implementation, cleanup deletes 4 keys (jkey, tkey, skey, dkey)
+            # and sets ckey to 'done', returning 1 instead of the count of deleted keys
+            self.b._chord_cleanup_script = original_cleanup_script
+            cleanup_result = original_cleanup_script(
+                keys=[ckey, jkey, tkey, skey, dkey],
+                args=[token_b, int(600)],
+                client=self.b.client,
+            )
+            assert cleanup_result == 1
+
+            assert self.b.client.get(ckey) == b'done'
+            assert self.b.client.get(jkey) is None
+            assert self.b.client.get(tkey) is None
+            assert self.b.client.get(skey) is None
+            assert self.b.client.exists(dkey) == 0
+
+        self.app.conf.result_chord_expires = old_chord_expires
+
+    def test_on_chord_part_return__copy_counted_before_cleanup(self):
+        """Test the race condition: two concurrent copies of the final task
+        cannot both dispatch the callback.
+
+        This reproduces the original race by injecting a duplicate execution
+        during the first copy's chord_part_return script invocation. With atomic
+        claim acquisition, only one copy can acquire the claim and dispatch.
+        """
+        from redis.commands.core import Script
+
+        old_chord_expires = self.app.conf.result_chord_expires
+        self.app.conf.result_chord_expires = 600
+        self.b = self.Backend(app=self.app)
+        self.b.client = self.FakeRedis()
+
+        with self.chord_context(2) as (tasks, _, callback):
+            self.b.on_chord_part_return(tasks[0].request, states.SUCCESS, 10)
+
+            real_call = Script.__call__
+            calls = []
+
+            def call(script, *args, **kwargs):
+                result = real_call(script, *args, **kwargs)
+                calls.append(script)
+                if len(calls) == 1:
+                    with patch.object(Script, '__call__', real_call):
+                        self.b.on_chord_part_return(
+                            tasks[1].request, states.SUCCESS, 20
+                        )
+                return result
+
+            with patch.object(Script, '__call__', call):
+                self.b.on_chord_part_return(
+                    tasks[1].request, states.SUCCESS, 20
+                )
+
+            callback.delay.assert_called_once_with([10, 20])
+
+        self.app.conf.result_chord_expires = old_chord_expires
+
     def test_on_chord_part_return__expires(self):
         self.app.conf.result_chord_expires = 600
         self.b = self.Backend(app=self.app)
-        self.b.client = client = self.FakeRedis()
+        self.b.client = self.FakeRedis()
 
         with self.chord_context(2) as (tasks, request, _):
             gkey = self.b.get_key_for_group(request.group)
-            client.set(gkey, 'a saved GroupResult')
+            self.b.client.set(gkey, 'a saved GroupResult')
             self.b.on_chord_part_return(tasks[0].request, states.SUCCESS, 10)
             for suffix in ('.j', '.s', '.d'):
                 key = self.b.get_key_for_group(request.group, suffix)
-                assert client.ttl(key) == 600
+                assert self.b.client.ttl(key) == 600
             # The group key is kept for at least result_expires (one day)
-            assert client.ttl(gkey) == 86400
+            assert self.b.client.ttl(gkey) == 86400
 
 
 class test_RedisBackend_chords_complex(basetest_RedisBackend):
